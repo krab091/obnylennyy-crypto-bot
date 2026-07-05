@@ -1,10 +1,12 @@
 import os
 import requests
 import logging
+import threading
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ChatAction
 from datetime import datetime
+from flask import Flask
 
 # Настройка логирования
 logging.basicConfig(
@@ -454,7 +456,25 @@ class CryptoBot:
     def run(self):
         """Запустить бота"""
         logger.info("🚀 Бот запущен!")
-        self.app.run_polling()
+
+        # Запустить бота в отдельном потоке
+        bot_thread = threading.Thread(target=self.app.run_polling, daemon=True)
+        bot_thread.start()
+
+        # Запустить HTTP сервер для Railway
+        app = Flask(__name__)
+
+        @app.route('/health', methods=['GET'])
+        def health():
+            return {'status': 'ok'}, 200
+
+        @app.route('/', methods=['GET'])
+        def index():
+            return {'bot': 'running'}, 200
+
+        port = int(os.getenv('PORT', 5000))
+        logger.info(f"HTTP сервер запущен на порту {port}")
+        app.run(host='0.0.0.0', port=port, debug=False)
 
 
 if __name__ == '__main__':
