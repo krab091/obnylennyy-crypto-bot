@@ -1,10 +1,16 @@
 import os
+import sys
 import requests
 import logging
 from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ChatAction
-from datetime import datetime
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Настройка логирования
 logging.basicConfig(
@@ -14,7 +20,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы
-TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN', '8911297572:AAGrYoJ4LsNifECKyDpQVvJ2nPqoXJtSFfQ')
+TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
+if not TELEGRAM_TOKEN:
+    logger.error(
+        "TELEGRAM_TOKEN не задан. Установи переменную окружения TELEGRAM_TOKEN "
+        "(в Railway: Variables, локально: .env или export)."
+    )
+    sys.exit(1)
+
 COINGECKO_API = 'https://api.coingecko.com/api/v3'
 
 class CryptoAnalyzer:
@@ -48,11 +61,9 @@ class CryptoAnalyzer:
             params = {
                 'ids': coin_id,
                 'vs_currencies': 'usd',
-                'include_market_cap': True,
-                'include_24hr_vol': True,
-                'include_24hr_change': True,
-                'include_7d_change': True,
-                'include_30d_change': True
+                'include_market_cap': 'true',
+                'include_24hr_vol': 'true',
+                'include_24hr_change': 'true',
             }
             response = requests.get(url, params=params, timeout=10)
             response.raise_for_status()
@@ -135,8 +146,11 @@ class CryptoAnalyzer:
         market_cap = market_data.get('usd_market_cap')
         volume_24h = market_data.get('usd_24h_vol')
         change_24h = market_data.get('usd_24h_change', 0)
-        change_7d = market_data.get('usd_7d_change', 0)
-        change_30d = market_data.get('usd_30d_change', 0)
+
+        # /simple/price не отдаёт 7d/30d — берём из /coins/{id}.market_data
+        full_market_data = (full_data or {}).get('market_data', {})
+        change_7d = full_market_data.get('price_change_percentage_7d') or 0
+        change_30d = full_market_data.get('price_change_percentage_30d') or 0
 
         # Определение риска
         risk_level, risk_reasons = CryptoAnalyzer.get_risk_level(market_cap, volume_24h, change_24h)
@@ -212,9 +226,30 @@ class CryptoBot:
 
     def __init__(self, token: str):
         self.token = token
-        self.app = Application.builder().token(token).build()
+        self.app = Application.builder().token(token).post_init(self._post_init).build()
         self.analyzer = CryptoAnalyzer()
         self._register_handlers()
+        self.app.add_error_handler(self._error_handler)
+
+    async def _post_init(self, app: Application):
+        """Регистрация списка команд в меню Telegram"""
+        await app.bot.set_my_commands([
+            BotCommand("start", "Начать работу с ботом"),
+            BotCommand("analyze", "Полный анализ монеты"),
+            BotCommand("price", "Быстрая цена"),
+            BotCommand("compare", "Сравнение двух монет"),
+            BotCommand("top", "Топ 20 монет по объёму"),
+            BotCommand("help", "Справка"),
+        ])
+
+    async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Глобальный обработчик ошибок — логирует, не роняет бота"""
+        logger.error("Ошибка при обработке апдейта %s: %s", update, context.error, exc_info=context.error)
+        if isinstance(update, Update) and update.effective_message:
+            try:
+                await update.effective_message.reply_text("❌ Произошла ошибка, попробуй ещё раз чуть позже")
+            except Exception:
+                pass
 
     def _register_handlers(self):
         """Регистрация обработчиков"""
@@ -391,18 +426,21 @@ class CryptoBot:
         cap1 = data1.get('usd_market_cap')
         cap2 = data2.get('usd_market_cap')
 
+        cap1_str = f"${cap1/1_000_000_000:.2f}B" if cap1 else 'N/A'
+        cap2_str = f"${cap2/1_000_000_000:.2f}B" if cap2 else 'N/A'
+
         message = f"""
 ⚖️ **СРАВНЕНИЕ**
 
 💰 {coin1_name.upper()}
    Цена: {self.analyzer.format_price(price1)}
    24h: {change1:+.2f}%
-   Market Cap: ${cap1/1_000_000_000:.2f}B if cap1 else 'N/A'
+   Market Cap: {cap1_str}
 
 💰 {coin2_name.upper()}
    Цена: {self.analyzer.format_price(price2)}
    24h: {change2:+.2f}%
-   Market Cap: ${cap2/1_000_000_000:.2f}B if cap2 else 'N/A'
+   Market Cap: {cap2_str}
 
 🏆 Лидер по изменениям (24h): {coin1_name if abs(change1) > abs(change2) else coin2_name}
         """
@@ -453,8 +491,11 @@ class CryptoBot:
 
     def run(self):
         """Запустить бота"""
-        logger.info("🚀 Бот запущен!")
-        self.app.run_polling(allowed_updates=Update.ALL_TYPES)
+        logger.info("🚀 Бот запускается...")
+        self.app.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True,
+        )
 
 
 if __name__ == '__main__':
