@@ -448,26 +448,59 @@ class ExchangeAggregator:
 
 
 class NewsService:
-    """Заголовки новостей по ключевому слову (CryptoCompare News API, без ключа)"""
+    """Заголовки новостей по ключевому слову — RSS-ленты крупных крипто-СМИ, без ключа.
 
-    NEWS_URL = 'https://min-api.cryptocompare.com/data/v2/news/'
+    Раньше здесь был min-api.cryptocompare.com/data/v2/news — но CryptoCompare (сейчас
+    CoinDesk Data) перевели свой REST API на обязательную регистрацию с API-ключом,
+    поэтому бесключевые запросы перестали отдавать данные. RSS остаётся публичным.
+    """
+
+    RSS_FEEDS = [
+        'https://www.coindesk.com/arc/outboundfeeds/rss/',
+        'https://cointelegraph.com/rss',
+    ]
 
     @staticmethod
     def get_news(keyword: str, limit: int = 5) -> list:
-        try:
-            response = requests.get(NewsService.NEWS_URL, params={'lang': 'EN'}, timeout=10)
-            response.raise_for_status()
-            items = response.json().get('Data', [])
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Ошибка при получении новостей: {e}")
+        import xml.etree.ElementTree as ET
+        from email.utils import parsedate_to_datetime
+
+        all_items = []
+        for feed_url in NewsService.RSS_FEEDS:
+            try:
+                response = requests.get(feed_url, timeout=10, headers={'User-Agent': 'Mozilla/5.0'})
+                response.raise_for_status()
+                root = ET.fromstring(response.content)
+                channel = root.find('channel')
+                if channel is None:
+                    continue
+                source_name = channel.findtext('title') or feed_url
+                for item in channel.findall('item'):
+                    all_items.append({
+                        'title': (item.findtext('title') or '').strip(),
+                        'url': (item.findtext('link') or '').strip(),
+                        'source': source_name.strip(),
+                        'pub_date': item.findtext('pubDate') or '',
+                    })
+            except Exception as e:
+                logger.warning(f"Не удалось получить RSS {feed_url}: {e}")
+                continue
+
+        if not all_items:
             return []
 
         keyword_lower = keyword.lower()
-        matched = [
-            n for n in items
-            if keyword_lower in n.get('title', '').lower() or keyword_lower in n.get('categories', '').lower()
-        ]
-        return (matched or items)[:limit]
+        matched = [n for n in all_items if keyword_lower in n['title'].lower()]
+        result = matched or all_items
+
+        def sort_key(n):
+            try:
+                return parsedate_to_datetime(n['pub_date'])
+            except Exception:
+                return datetime.min.replace(tzinfo=timezone.utc)
+
+        result.sort(key=sort_key, reverse=True)
+        return result[:limit]
 
 
 class Keyboards:
@@ -920,8 +953,8 @@ class CryptoBot:
 
         lines = [f"📰 <b>НОВОСТИ: {esc(keyword.upper())}</b>", DIVIDER, ""]
         for item in items:
-            title = esc(item.get('title', 'Без заголовка'))
-            source = esc(item.get('source_info', {}).get('name') or item.get('source', ''))
+            title = esc(item.get('title') or 'Без заголовка')
+            source = esc(item.get('source', ''))
             url = item.get('url', '')
             lines.append(f"• <b>{title}</b>")
             if source:
