@@ -49,9 +49,11 @@ git push -u origin main
 
 1. В Railway перейди в Project Settings
 2. Нажми на "Environment"
-3. Добавь переменную:
+3. Добавь переменные (значения — свои, не коммить их в git):
    ```
-   TELEGRAM_TOKEN=8911297572:AAGrYoJ4LsNifECKyDpQVvJ2nPqoXJtSFfQ
+   TELEGRAM_TOKEN=<твой токен от BotFather>
+   COMMUNITY_CHAT_URL=<ссылка на группу/чат>
+   COMMUNITY_CHANNEL_URL=<ссылка на канал, если уже есть>
    ```
 4. Нажми "Deploy" или бот автоматически перезагрузится
 
@@ -90,6 +92,8 @@ git push -u origin main
 | Переменная | Значение | Обязательна |
 |-----------|---------|-----------|
 | TELEGRAM_TOKEN | Твой токен бота | ✅ Да |
+| COMMUNITY_CHAT_URL | Ссылка на группу/чат сообщества | ✅ Да |
+| COMMUNITY_CHANNEL_URL | Ссылка на канал (broadcast) | ➖ Нет, пока канала нет |
 
 ---
 
