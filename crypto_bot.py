@@ -1,14 +1,26 @@
 import os
 import sys
+import io
 import json
 import asyncio
-import requests
 import logging
+import requests
+from html import escape as esc
 from pathlib import Path
 from datetime import datetime, timezone
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
-from telegram.constants import ChatAction
+
+import matplotlib
+matplotlib.use('Agg')  # без графического дисплея (сервер/Railway)
+import matplotlib.pyplot as plt
+
+from telegram import (
+    Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+)
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters,
+)
 
 try:
     from dotenv import load_dotenv
@@ -48,6 +60,32 @@ FREE_DAILY_ADVANCED_LIMIT = 2
 
 DATA_FILE = Path(__file__).parent / 'community_data.json'
 
+# Фирменный стиль
+DIVIDER = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+ACCENT_HEX = '#D97706'
+
+# Популярные монеты для быстрого выбора кнопками: (coingecko_id, тикер, эмодзи)
+POPULAR_COINS = [
+    ('bitcoin', 'BTC', '₿'),
+    ('ethereum', 'ETH', 'Ξ'),
+    ('solana', 'SOL', '◎'),
+    ('binancecoin', 'BNB', '🔶'),
+    ('ripple', 'XRP', '✕'),
+    ('the-open-network', 'TON', '💎'),
+    ('dogecoin', 'DOGE', '🐶'),
+    ('cardano', 'ADA', '🔷'),
+]
+
+PREMIUM_ACTIONS = {'ta', 'exchanges', 'screener', 'news'}
+
+PICK_PROMPTS = {
+    'analyze': "📊 <b>Анализ монеты</b>\nВыбери из популярных или введи свою:",
+    'price': "💰 <b>Быстрая цена</b>\nВыбери из популярных или введи свою:",
+    'ta': "📐 <b>Технический анализ</b>\nВыбери из популярных или введи свою:",
+    'exchanges': "🏦 <b>Цена на биржах</b>\nВыбери из популярных или введи свою:",
+    'news': "📰 <b>Новости по монете</b>\nВыбери из популярных или введи свою:",
+}
+
 
 def load_data() -> dict:
     """Загрузить данные сообщества (пользователи, рефералы, лимиты)"""
@@ -71,6 +109,7 @@ def save_data(data: dict):
 
 def today_str() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
 
 class CryptoAnalyzer:
     """Класс для анализа криптопроектов"""
@@ -134,7 +173,7 @@ class CryptoAnalyzer:
         if len(prices) < period:
             return None
 
-        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
         seed = deltas[:period]
         up = sum([x for x in seed if x > 0]) / period
         down = -sum([x for x in seed if x < 0]) / period
@@ -149,6 +188,8 @@ class CryptoAnalyzer:
     @staticmethod
     def format_price(price: float) -> str:
         """Форматировать цену"""
+        if price is None:
+            return "н/д"
         if price >= 1:
             return f"${price:,.2f}"
         elif price >= 0.01:
@@ -162,7 +203,6 @@ class CryptoAnalyzer:
         risk_score = 0
         reasons = []
 
-        # Риск на основе market cap
         if market_cap is None or market_cap < 10_000_000:
             risk_score += 3
             reasons.append("Маленький Market Cap")
@@ -170,7 +210,6 @@ class CryptoAnalyzer:
             risk_score += 2
             reasons.append("Средний Market Cap")
 
-        # Риск на основе волатильности
         if price_change_24h and abs(price_change_24h) > 20:
             risk_score += 2
             reasons.append("Высокая волатильность")
@@ -179,88 +218,17 @@ class CryptoAnalyzer:
         return risk_level, reasons
 
     @staticmethod
-    def format_analysis(coin_name: str, coin_id: str, market_data: dict, full_data: dict = None) -> str:
-        """Форматировать анализ для постинга"""
-        if not market_data:
-            return f"❌ Не найдена информация о {coin_name}"
-
-        price = market_data.get('usd', 0)
-        market_cap = market_data.get('usd_market_cap')
-        volume_24h = market_data.get('usd_24h_vol')
-        change_24h = market_data.get('usd_24h_change', 0)
-
-        # /simple/price не отдаёт 7d/30d — берём из /coins/{id}.market_data
-        full_market_data = (full_data or {}).get('market_data', {})
-        change_7d = full_market_data.get('price_change_percentage_7d') or 0
-        change_30d = full_market_data.get('price_change_percentage_30d') or 0
-
-        # Определение риска
-        risk_level, risk_reasons = CryptoAnalyzer.get_risk_level(market_cap, volume_24h, change_24h)
-
-        # Форматирование
-        formatted_price = CryptoAnalyzer.format_price(price)
-
-        # Emoji для изменений
-        change_24h_emoji = "📈" if change_24h >= 0 else "📉"
-        change_7d_emoji = "📈" if change_7d >= 0 else "📉"
-        change_30d_emoji = "📈" if change_30d >= 0 else "📉"
-
-        # Форматирование market cap
-        if market_cap:
-            if market_cap >= 1_000_000_000:
-                market_cap_str = f"${market_cap/1_000_000_000:.2f}B"
-            elif market_cap >= 1_000_000:
-                market_cap_str = f"${market_cap/1_000_000:.2f}M"
-            else:
-                market_cap_str = f"${market_cap:,.0f}"
-        else:
-            market_cap_str = "N/A"
-
-        # Форматирование volume
-        if volume_24h:
-            if volume_24h >= 1_000_000_000:
-                volume_str = f"${volume_24h/1_000_000_000:.2f}B"
-            elif volume_24h >= 1_000_000:
-                volume_str = f"${volume_24h/1_000_000:.2f}M"
-            else:
-                volume_str = f"${volume_24h:,.0f}"
-        else:
-            volume_str = "N/A"
-
-        # Риск статус
-        if risk_level <= 3:
-            risk_emoji = "🟢"
-            risk_text = "Низкий"
-        elif risk_level <= 6:
-            risk_emoji = "🟡"
-            risk_text = "Средний"
-        else:
-            risk_emoji = "🔴"
-            risk_text = "Высокий"
-
-        analysis = f"""
-📊 **{coin_name.upper()}** ({coin_id.upper()})
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💰 **Цена**: {formatted_price}
-
-📈 **Изменения**:
-   {change_24h_emoji} 24h: {change_24h:+.2f}%
-   {change_7d_emoji} 7d: {change_7d:+.2f}%
-   {change_30d_emoji} 30d: {change_30d:+.2f}%
-
-💎 **Market Cap**: {market_cap_str}
-📊 **Volume 24h**: {volume_str}
-
-{risk_emoji} **Риск**: {risk_level}/10 ({risk_text})
-   {', '.join(risk_reasons) if risk_reasons else 'Низкие риски'}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 **Статус**: Для подробного анализа → /analyze {coin_id}
-Получи полный доступ в ОБНУЛЕННЫЙ 📱
-"""
-        return analysis.strip()
+    def format_compact(value: float) -> str:
+        """$1.28T / $32.4M и т.п."""
+        if not value:
+            return "N/A"
+        if value >= 1_000_000_000_000:
+            return f"${value / 1_000_000_000_000:.2f}T"
+        if value >= 1_000_000_000:
+            return f"${value / 1_000_000_000:.2f}B"
+        if value >= 1_000_000:
+            return f"${value / 1_000_000:.2f}M"
+        return f"${value:,.0f}"
 
 
 class TechnicalAnalyzer:
@@ -285,6 +253,12 @@ class TechnicalAnalyzer:
         if len(values) < period:
             return None
         return sum(values[-period:]) / period
+
+    @staticmethod
+    def sma_series(values: list, period: int) -> list:
+        if len(values) < period:
+            return []
+        return [sum(values[i - period + 1:i + 1]) / period for i in range(period - 1, len(values))]
 
     @staticmethod
     def _ema_series(values: list, period: int) -> list:
@@ -329,6 +303,21 @@ class TechnicalAnalyzer:
         variance = sum((x - mean) ** 2 for x in window) / period
         std = variance ** 0.5
         return {'upper': mean + num_std * std, 'middle': mean, 'lower': mean - num_std * std}
+
+    @staticmethod
+    def bollinger_series(values: list, period: int = 20, num_std: float = 2):
+        if len(values) < period:
+            return [], [], []
+        uppers, mids, lowers = [], [], []
+        for i in range(period - 1, len(values)):
+            window = values[i - period + 1:i + 1]
+            mean = sum(window) / period
+            variance = sum((x - mean) ** 2 for x in window) / period
+            std = variance ** 0.5
+            uppers.append(mean + num_std * std)
+            mids.append(mean)
+            lowers.append(mean - num_std * std)
+        return uppers, mids, lowers
 
     @staticmethod
     def summarize(prices: list, current_price: float = None) -> dict:
@@ -395,6 +384,45 @@ class TechnicalAnalyzer:
         }
 
 
+def generate_ta_chart(prices: list, label: str) -> bytes:
+    """PNG-график: цена + SMA20 + Bollinger Bands, тёмная тема бренда"""
+    sma20 = TechnicalAnalyzer.sma_series(prices, 20)
+    upper, _mid, lower = TechnicalAnalyzer.bollinger_series(prices, 20)
+
+    bg = '#0f1115'
+    fig, ax = plt.subplots(figsize=(9, 5), dpi=150)
+    fig.patch.set_facecolor(bg)
+    ax.set_facecolor(bg)
+
+    x_full = list(range(len(prices)))
+    ax.plot(x_full, prices, color='#f5f5f5', linewidth=1.6, label='Цена', zorder=3)
+
+    if upper and lower:
+        x_bb = list(range(len(prices) - len(upper), len(prices)))
+        ax.plot(x_bb, upper, color=ACCENT_HEX, linewidth=0.9, alpha=0.8, linestyle='--')
+        ax.plot(x_bb, lower, color=ACCENT_HEX, linewidth=0.9, alpha=0.8, linestyle='--')
+        ax.fill_between(x_bb, lower, upper, color=ACCENT_HEX, alpha=0.08)
+
+    if sma20:
+        x_sma = list(range(len(prices) - len(sma20), len(prices)))
+        ax.plot(x_sma, sma20, color='#3B82F6', linewidth=1.3, label='SMA20')
+
+    ax.set_title(f"{label} — цена, SMA20, Bollinger Bands", color='#f5f5f5', fontsize=13, pad=12)
+    ax.tick_params(colors='#9CA3AF', labelsize=8)
+    for spine in ax.spines.values():
+        spine.set_color('#2b2f38')
+    ax.grid(color='#232733', linewidth=0.5, alpha=0.6)
+    ax.set_xticks([])
+    ax.legend(loc='upper left', facecolor=bg, edgecolor='#2b2f38', labelcolor='#f5f5f5', fontsize=8)
+
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format='png', facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 class ExchangeAggregator:
     """Сравнение цены/объёма по нескольким биржам через ccxt"""
 
@@ -442,6 +470,91 @@ class NewsService:
         return (matched or items)[:limit]
 
 
+class Keyboards:
+    """Инлайн-клавиатуры бота — вся навигация кнопками, без ручного ввода команд"""
+
+    @staticmethod
+    def main_menu() -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton("📊 Анализ", callback_data="pick:analyze"),
+             InlineKeyboardButton("💰 Цена", callback_data="pick:price")],
+            [InlineKeyboardButton("📐 Тех.анализ", callback_data="pick:ta"),
+             InlineKeyboardButton("🏦 Биржи", callback_data="pick:exchanges")],
+            [InlineKeyboardButton("🔍 Скринер", callback_data="screener"),
+             InlineKeyboardButton("📰 Новости", callback_data="pick:news")],
+            [InlineKeyboardButton("🔝 Топ-20", callback_data="top"),
+             InlineKeyboardButton("⚖️ Сравнить", callback_data="cmp_pick")],
+            [InlineKeyboardButton("🧭 Сообщество", callback_data="community"),
+             InlineKeyboardButton("🎁 Пригласить", callback_data="invite")],
+            [InlineKeyboardButton("📜 Правила", callback_data="rules"),
+             InlineKeyboardButton("❓ Помощь", callback_data="help")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def coin_picker(action: str) -> InlineKeyboardMarkup:
+        rows, row = [], []
+        for coin_id, symbol, emoji in POPULAR_COINS:
+            token = symbol if action == 'exchanges' else coin_id
+            row.append(InlineKeyboardButton(f"{emoji} {symbol}", callback_data=f"go:{action}:{token}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✏️ Своя монета", callback_data=f"custom:{action}")])
+        rows.append([InlineKeyboardButton("🔙 Меню", callback_data="menu")])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def compare_picker() -> InlineKeyboardMarkup:
+        rows = [
+            [InlineKeyboardButton("BTC vs ETH", callback_data="cmp:bitcoin:ethereum")],
+            [InlineKeyboardButton("BTC vs SOL", callback_data="cmp:bitcoin:solana")],
+            [InlineKeyboardButton("ETH vs SOL", callback_data="cmp:ethereum:solana")],
+            [InlineKeyboardButton("✏️ Свои монеты", callback_data="cmp_custom")],
+            [InlineKeyboardButton("🔙 Меню", callback_data="menu")],
+        ]
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def coin_actions(current_action: str, coin_id: str, symbol: str = None) -> InlineKeyboardMarkup:
+        """Связанные действия под карточкой монеты + Обновить/Меню"""
+        symbol_token = (symbol or coin_id).upper()
+        options = [
+            ('analyze', '📊 Анализ', coin_id),
+            ('price', '💰 Цена', coin_id),
+            ('ta', '📐 ТА', coin_id),
+            ('exchanges', '🏦 Биржи', symbol_token),
+            ('news', '📰 Новости', coin_id),
+        ]
+        related = [(label, f"go:{act}:{token}") for act, label, token in options if act != current_action]
+
+        rows, row = [], []
+        for label, cb in related:
+            row.append(InlineKeyboardButton(label, callback_data=cb))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+
+        refresh_token = symbol_token if current_action == 'exchanges' else coin_id
+        rows.append([
+            InlineKeyboardButton("🔄 Обновить", callback_data=f"go:{current_action}:{refresh_token}"),
+            InlineKeyboardButton("🔙 Меню", callback_data="menu"),
+        ])
+        return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def simple_nav(refresh_callback: str = None) -> InlineKeyboardMarkup:
+        rows = []
+        if refresh_callback:
+            rows.append([InlineKeyboardButton("🔄 Обновить", callback_data=refresh_callback)])
+        rows.append([InlineKeyboardButton("🔙 Меню", callback_data="menu")])
+        return InlineKeyboardMarkup(rows)
+
+
 class CryptoBot:
     """Главный класс бота"""
 
@@ -455,11 +568,11 @@ class CryptoBot:
         self.app.add_error_handler(self._error_handler)
 
     async def _post_init(self, app: Application):
-        """Регистрация списка команд в меню Telegram"""
+        """Регистрация списка команд в меню Telegram (для тех, кто предпочитает печатать)"""
         me = await app.bot.get_me()
         self.bot_username = me.username
         await app.bot.set_my_commands([
-            BotCommand("start", "Начать работу с ботом"),
+            BotCommand("start", "Открыть главное меню"),
             BotCommand("analyze", "Полный анализ монеты"),
             BotCommand("price", "Быстрая цена"),
             BotCommand("compare", "Сравнение двух монет"),
@@ -474,47 +587,51 @@ class CryptoBot:
             BotCommand("help", "Справка"),
         ])
 
+    # ---------- Данные пользователей / лимиты ----------
+
     def _get_user_record(self, user_id: int) -> dict:
-        """Получить (и при необходимости создать) запись пользователя"""
         uid = str(user_id)
         if uid not in self.data['users']:
             self.data['users'][uid] = {
                 'first_seen': today_str(),
                 'referred_by': None,
                 'invited_count': 0,
-                'analyze_count': {},
             }
         return self.data['users'][uid]
 
     def _check_and_bump_limit(self, user_id: int, feature: str, daily_limit: int) -> tuple:
-        """Проверить дневной лимит free-тира по конкретной фиче.
-        Возвращает (allowed_without_upsell: bool, used_today: int)"""
+        """Возвращает (allowed_without_upsell: bool, used_today: int)"""
         record = self._get_user_record(user_id)
         day = today_str()
         usage = record.setdefault('usage', {})
         feature_usage = usage.setdefault(feature, {})
         used = feature_usage.get(day, 0)
         feature_usage[day] = used + 1
-        # Чистим старые дни, чтобы файл не разрастался
-        usage[feature] = {day: feature_usage[day]}
+        usage[feature] = {day: feature_usage[day]}  # чистим старые дни
         save_data(self.data)
         return used < daily_limit, used + 1
 
-    def _check_and_bump_free_limit(self, user_id: int) -> tuple:
-        """Обратная совместимость: лимит /analyze"""
-        return self._check_and_bump_limit(user_id, 'analyze', FREE_DAILY_ANALYZE_LIMIT)
+    def _upsell_footer(self, used_today: int, limit: int) -> str:
+        return (
+            f"\n\n🔒 Премиум-запросов на сегодня: {used_today}/{limit} использовано.\n"
+            f"Безлимит — в тарифе Standard: /community"
+        )
 
     async def _error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
-        """Глобальный обработчик ошибок — логирует, не роняет бота"""
         logger.error("Ошибка при обработке апдейта %s: %s", update, context.error, exc_info=context.error)
-        if isinstance(update, Update) and update.effective_message:
-            try:
-                await update.effective_message.reply_text("❌ Произошла ошибка, попробуй ещё раз чуть позже")
-            except Exception:
-                pass
+        if isinstance(update, Update):
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer("❌ Ошибка, попробуй ещё раз", show_alert=True)
+                except Exception:
+                    pass
+            elif update.effective_message:
+                try:
+                    await update.effective_message.reply_text("❌ Произошла ошибка, попробуй ещё раз чуть позже")
+                except Exception:
+                    pass
 
     def _register_handlers(self):
-        """Регистрация обработчиков"""
         self.app.add_handler(CommandHandler("start", self.start))
         self.app.add_handler(CommandHandler("help", self.help_command))
         self.app.add_handler(CommandHandler("analyze", self.analyze))
@@ -528,10 +645,571 @@ class CryptoBot:
         self.app.add_handler(CommandHandler("community", self.community))
         self.app.add_handler(CommandHandler("invite", self.invite))
         self.app.add_handler(CommandHandler("rules", self.rules))
+        self.app.add_handler(CallbackQueryHandler(self.on_callback))
         self.app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
+        self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+
+    # ---------- Резолв монеты ----------
+
+    async def _resolve_coin_id(self, query: str) -> str:
+        loop = asyncio.get_running_loop()
+        market_data = await loop.run_in_executor(None, self.analyzer.get_market_data, query)
+        if market_data:
+            return query
+        results = await loop.run_in_executor(None, self.analyzer.search_coin, query)
+        if results:
+            return results[0]['id']
+        return None
+
+    # ---------- Рендер: карточки монет ----------
+
+    async def _render_analyze(self, coin_id: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        market_data = await loop.run_in_executor(None, self.analyzer.get_market_data, coin_id)
+        full_data = await loop.run_in_executor(None, self.analyzer.get_coin_data, coin_id)
+
+        if not market_data:
+            return (f"❌ Не удалось получить данные по «{esc(coin_id)}»", Keyboards.simple_nav())
+
+        price = market_data.get('usd', 0)
+        market_cap = market_data.get('usd_market_cap')
+        volume_24h = market_data.get('usd_24h_vol')
+        change_24h = market_data.get('usd_24h_change', 0) or 0
+
+        full_market_data = (full_data or {}).get('market_data', {})
+        change_7d = full_market_data.get('price_change_percentage_7d') or 0
+        change_30d = full_market_data.get('price_change_percentage_30d') or 0
+
+        risk_level, risk_reasons = CryptoAnalyzer.get_risk_level(market_cap, volume_24h, change_24h)
+        risk_emoji = "🟢" if risk_level <= 3 else ("🟡" if risk_level <= 6 else "🔴")
+        risk_text = "Низкий" if risk_level <= 3 else ("Средний" if risk_level <= 6 else "Высокий")
+
+        name = esc((full_data or {}).get('name') or coin_id.capitalize())
+        symbol = esc(((full_data or {}).get('symbol') or coin_id)).upper()
+
+        e24 = "📈" if change_24h >= 0 else "📉"
+        e7 = "📈" if change_7d >= 0 else "📉"
+        e30 = "📈" if change_30d >= 0 else "📉"
+
+        text = (
+            f"📊 <b>{name} ({symbol})</b>\n{DIVIDER}\n\n"
+            f"💰 Цена: <code>{CryptoAnalyzer.format_price(price)}</code>\n\n"
+            f"📈 Изменения\n"
+            f"   {e24} 24ч: <code>{change_24h:+.2f}%</code>\n"
+            f"   {e7} 7д: <code>{change_7d:+.2f}%</code>\n"
+            f"   {e30} 30д: <code>{change_30d:+.2f}%</code>\n\n"
+            f"💎 Market Cap: <code>{CryptoAnalyzer.format_compact(market_cap)}</code>\n"
+            f"📊 Объём 24ч: <code>{CryptoAnalyzer.format_compact(volume_24h)}</code>\n\n"
+            f"{risk_emoji} Риск: <b>{risk_level}/10</b> ({risk_text})\n"
+            f"   <i>{esc(', '.join(risk_reasons)) if risk_reasons else 'Низкие риски'}</i>\n"
+            f"{DIVIDER}"
+        )
+        keyboard = Keyboards.coin_actions('analyze', coin_id, symbol)
+        return (text, keyboard)
+
+    async def _render_price(self, coin_id: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        market_data = await loop.run_in_executor(None, self.analyzer.get_market_data, coin_id)
+        if not market_data:
+            return (f"❌ Не удалось получить цену «{esc(coin_id)}»", Keyboards.simple_nav())
+
+        price = market_data.get('usd', 0)
+        change_24h = market_data.get('usd_24h_change', 0) or 0
+        emoji = "📈" if change_24h >= 0 else "📉"
+
+        text = (
+            f"💰 <b>{esc(coin_id.upper())}</b>\n{DIVIDER}\n\n"
+            f"Цена: <code>{CryptoAnalyzer.format_price(price)}</code>\n"
+            f"{emoji} 24ч: <code>{change_24h:+.2f}%</code>\n{DIVIDER}"
+        )
+        keyboard = Keyboards.coin_actions('price', coin_id)
+        return (text, keyboard)
+
+    async def _render_compare(self, coin1: str, coin2: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        data1 = await loop.run_in_executor(None, self.analyzer.get_market_data, coin1)
+        data2 = await loop.run_in_executor(None, self.analyzer.get_market_data, coin2)
+
+        if not data1 or not data2:
+            return ("❌ Не удалось найти одну или обе монеты", Keyboards.simple_nav())
+
+        price1, price2 = data1.get('usd', 0), data2.get('usd', 0)
+        change1, change2 = data1.get('usd_24h_change', 0) or 0, data2.get('usd_24h_change', 0) or 0
+        cap1, cap2 = data1.get('usd_market_cap'), data2.get('usd_market_cap')
+        leader = coin1 if abs(change1) > abs(change2) else coin2
+
+        text = (
+            f"⚖️ <b>СРАВНЕНИЕ</b>\n{DIVIDER}\n\n"
+            f"💰 <b>{esc(coin1.upper())}</b>\n"
+            f"   Цена: <code>{CryptoAnalyzer.format_price(price1)}</code>\n"
+            f"   24ч: <code>{change1:+.2f}%</code>\n"
+            f"   Market Cap: <code>{CryptoAnalyzer.format_compact(cap1)}</code>\n\n"
+            f"💰 <b>{esc(coin2.upper())}</b>\n"
+            f"   Цена: <code>{CryptoAnalyzer.format_price(price2)}</code>\n"
+            f"   24ч: <code>{change2:+.2f}%</code>\n"
+            f"   Market Cap: <code>{CryptoAnalyzer.format_compact(cap2)}</code>\n\n"
+            f"🏆 Лидер по изменению (24ч): <b>{esc(leader.upper())}</b>\n{DIVIDER}"
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Обновить", callback_data=f"cmp:{coin1}:{coin2}")],
+            [InlineKeyboardButton("⚖️ Другая пара", callback_data="cmp_pick")],
+            [InlineKeyboardButton("🔙 Меню", callback_data="menu")],
+        ])
+        return (text, keyboard)
+
+    async def _render_top(self) -> tuple:
+        loop = asyncio.get_running_loop()
+        try:
+            def fetch():
+                url = f'{COINGECKO_API}/coins/markets'
+                params = {'vs_currency': 'usd', 'order': 'volume_desc', 'per_page': 20,
+                          'sparkline': False, 'locale': 'en'}
+                r = requests.get(url, params=params, timeout=10)
+                r.raise_for_status()
+                return r.json()
+
+            coins = await loop.run_in_executor(None, fetch)
+        except Exception as e:
+            return (f"❌ Ошибка при получении топа: {esc(str(e))}", Keyboards.simple_nav())
+
+        lines = [f"🔝 <b>ТОП 20 МОНЕТ ПО ОБЪЁМУ</b>", DIVIDER, ""]
+        for i, coin in enumerate(coins, 1):
+            name = esc(coin['name'])
+            symbol = esc(coin['symbol'].upper())
+            price_str = CryptoAnalyzer.format_price(coin['current_price'])
+            change = coin.get('price_change_percentage_24h') or 0
+            emoji = "📈" if change >= 0 else "📉"
+            vol_str = CryptoAnalyzer.format_compact(coin.get('total_volume'))
+            lines.append(f"{i}. {name} ({symbol})\n   {price_str} {emoji} <code>{change:+.2f}%</code> | Vol: {vol_str}")
+
+        text = "\n".join(lines)
+        keyboard = Keyboards.simple_nav(refresh_callback="top")
+        return (text, keyboard)
+
+    async def _render_ta(self, coin_id: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        prices = await loop.run_in_executor(None, TechnicalAnalyzer.get_price_history, coin_id, 100)
+        if not prices:
+            return (f"❌ Недостаточно данных по «{esc(coin_id)}»", Keyboards.simple_nav(), None)
+
+        summary = TechnicalAnalyzer.summarize(prices)
+        if 'error' in summary:
+            return (f"❌ {esc(summary['error'])}", Keyboards.simple_nav(), None)
+
+        rsi_str = f"{summary['rsi']:.1f}" if summary['rsi'] is not None else "н/д"
+        sma_str = CryptoAnalyzer.format_price(summary['sma20']) if summary['sma20'] else "н/д"
+        if summary['macd']:
+            macd_str = f"{summary['macd']['macd']:.4f} / сигнал {summary['macd']['signal']:.4f}"
+        else:
+            macd_str = "н/д (мало данных)"
+        if summary['bollinger']:
+            bb = summary['bollinger']
+            bb_str = f"{CryptoAnalyzer.format_price(bb['lower'])} — {CryptoAnalyzer.format_price(bb['upper'])}"
+        else:
+            bb_str = "н/д"
+
+        label = esc(coin_id.upper())
+        caption = (
+            f"📐 <b>{label}</b> — технический анализ\n{DIVIDER}\n\n"
+            f"RSI(14): <code>{rsi_str}</code>   SMA20: <code>{sma_str}</code>\n"
+            f"MACD: <code>{macd_str}</code>\n"
+            f"Bollinger: <code>{bb_str}</code>\n\n"
+            f"{summary['verdict']}\n"
+            f"<i>{esc(', '.join(summary['reasons'])) if summary['reasons'] else 'недостаточно данных'}</i>\n"
+            f"{DIVIDER}\n⚠️ Не финансовый совет — сводка индикаторов."
+        )
+        chart = await loop.run_in_executor(None, generate_ta_chart, prices, coin_id.upper())
+        keyboard = Keyboards.coin_actions('ta', coin_id)
+        return (caption, keyboard, chart)
+
+    async def _render_exchanges(self, ticker: str, quote: str = 'USDT') -> tuple:
+        symbol = f"{ticker.upper()}/{quote.upper()}"
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, ExchangeAggregator.fetch_all_sync, symbol)
+
+        lines = [f"🏦 <b>{esc(symbol)} НА БИРЖАХ</b>", DIVIDER, ""]
+        prices = {}
+        for ex_id, data in results.items():
+            if 'error' in data or not data.get('price'):
+                lines.append(f"{ex_id.capitalize()}: н/д")
+                continue
+            price = data['price']
+            prices[ex_id] = price
+            vol = data.get('volume')
+            vol_str = f", объём: {CryptoAnalyzer.format_compact(vol)}" if vol else ""
+            lines.append(f"{ex_id.capitalize()}: <code>{CryptoAnalyzer.format_price(price)}</code>{vol_str}")
+
+        if len(prices) >= 2:
+            max_ex, min_ex = max(prices, key=prices.get), min(prices, key=prices.get)
+            spread_pct = (prices[max_ex] - prices[min_ex]) / prices[min_ex] * 100
+            lines.append("")
+            lines.append(f"📊 Разброс цен: <code>{spread_pct:.2f}%</code> ({min_ex.capitalize()} → {max_ex.capitalize()})")
+        elif not prices:
+            lines.append("")
+            lines.append("Не удалось получить данные ни с одной биржи — проверь тикер.")
+
+        lines.append("")
+        lines.append("⚠️ Не является рекомендацией к арбитражу или сделкам.")
+        lines.append(DIVIDER)
+
+        text = "\n".join(lines)
+        keyboard = Keyboards.coin_actions('exchanges', ticker.lower(), ticker.upper())
+        return (text, keyboard)
+
+    async def _render_screener(self) -> tuple:
+        loop = asyncio.get_running_loop()
+        try:
+            def fetch():
+                url = f'{COINGECKO_API}/coins/markets'
+                params = {'vs_currency': 'usd', 'order': 'volume_desc', 'per_page': 15,
+                          'sparkline': True, 'price_change_percentage': '24h', 'locale': 'en'}
+                r = requests.get(url, params=params, timeout=15)
+                r.raise_for_status()
+                return r.json()
+
+            coins = await loop.run_in_executor(None, fetch)
+        except Exception as e:
+            return (f"❌ Ошибка скринера: {esc(str(e))}", Keyboards.simple_nav())
+
+        oversold, overbought, neutral_count = [], [], 0
+        for coin in coins:
+            sparkline = (coin.get('sparkline_in_7d') or {}).get('price') or []
+            if len(sparkline) < 20:
+                continue
+            rsi = CryptoAnalyzer.calculate_rsi(sparkline, period=14)
+            if rsi is None:
+                continue
+            symbol = esc(coin['symbol'].upper())
+            price = coin['current_price']
+            if rsi < 35:
+                oversold.append((symbol, rsi, price))
+            elif rsi > 65:
+                overbought.append((symbol, rsi, price))
+            else:
+                neutral_count += 1
+
+        lines = ["🔍 <b>СКРИНЕР (ТОП-15 ПО ОБЪЁМУ)</b>", DIVIDER, "", "🟢 Перепроданные (RSI &lt; 35):"]
+        if oversold:
+            for symbol, rsi, price in sorted(oversold, key=lambda x: x[1]):
+                lines.append(f"   {symbol}: RSI <code>{rsi:.0f}</code>, {CryptoAnalyzer.format_price(price)}")
+        else:
+            lines.append("   Нет совпадений")
+
+        lines.append("")
+        lines.append("🔴 Перекупленные (RSI &gt; 65):")
+        if overbought:
+            for symbol, rsi, price in sorted(overbought, key=lambda x: -x[1]):
+                lines.append(f"   {symbol}: RSI <code>{rsi:.0f}</code>, {CryptoAnalyzer.format_price(price)}")
+        else:
+            lines.append("   Нет совпадений")
+
+        lines.append("")
+        lines.append(f"⚪ Нейтральных: {neutral_count}")
+        lines.append(DIVIDER)
+        lines.append("⚠️ RSI по 7-дневным данным — сигнал для проверки через ТА, не сигнал к сделке.")
+
+        text = "\n".join(lines)
+        keyboard = Keyboards.simple_nav(refresh_callback="screener")
+        return (text, keyboard)
+
+    async def _render_news(self, keyword: str) -> tuple:
+        loop = asyncio.get_running_loop()
+        items = await loop.run_in_executor(None, NewsService.get_news, keyword, 5)
+        if not items:
+            return (f"❌ Не удалось получить новости по «{esc(keyword)}»", Keyboards.simple_nav())
+
+        lines = [f"📰 <b>НОВОСТИ: {esc(keyword.upper())}</b>", DIVIDER, ""]
+        for item in items:
+            title = esc(item.get('title', 'Без заголовка'))
+            source = esc(item.get('source_info', {}).get('name') or item.get('source', ''))
+            url = item.get('url', '')
+            lines.append(f"• <b>{title}</b>")
+            if source:
+                lines.append(f"  {source}")
+            if url:
+                lines.append(f'  <a href="{esc(url)}">Читать →</a>')
+            lines.append("")
+
+        lines.append("⚠️ Заголовки без редактуры — проверяй первоисточник.")
+        lines.append(DIVIDER)
+
+        text = "\n".join(lines)
+        keyboard = Keyboards.coin_actions('news', keyword.lower())
+        return (text, keyboard)
+
+    def _render_community(self) -> tuple:
+        links_block = f"💬 Чат: {COMMUNITY_CHAT_URL}"
+        if COMMUNITY_CHANNEL_URL:
+            links_block += f"\n📢 Канал: {COMMUNITY_CHANNEL_URL}"
+
+        text = (
+            f"🧭 <b>ОБНУЛЕННЫЙ — сообщество трезвых крипто-инвесторов</b>\n\n"
+            f"Без сигналов «купи на хаях». Только данные, риск-скоринг и живое обсуждение.\n\n"
+            f"{links_block}\n\n"
+            f"<b>Тарифы:</b>\n\n"
+            f"🆓 <b>Free</b>\n"
+            f"Чат, /price, /top, {FREE_DAILY_ANALYZE_LIMIT} разбора анализа и {FREE_DAILY_ADVANCED_LIMIT} премиум-запроса (ТА/биржи/скринер/новости) в день\n\n"
+            f"⭐ <b>Standard</b> (~700-900 ₽/мес)\n"
+            f"Безлимит на все функции, ежедневный дайджест, приоритет в чате\n\n"
+            f"💎 <b>Pro</b> (~2000-2500 ₽/мес)\n"
+            f"Всё из Standard + закрытый чат с разборами портфелей, доступ к экспертам\n\n"
+            f"Оплата — через Telegram Stars прямо в боте (скоро)."
+        )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎁 Пригласить и получить бонус", callback_data="invite")],
+            [InlineKeyboardButton("🔙 Меню", callback_data="menu")],
+        ])
+        return (text, keyboard)
+
+    async def _render_invite(self, user_id: int, context: ContextTypes.DEFAULT_TYPE) -> tuple:
+        record = self._get_user_record(user_id)
+        save_data(self.data)
+        username = self.bot_username or (await context.bot.get_me()).username
+        link = f"https://t.me/{username}?start=ref_{user_id}"
+        invited = record.get('invited_count', 0)
+
+        text = (
+            f"🎁 <b>Приглашай друзей в ОБНУЛЕННЫЙ</b>\n\n"
+            f"Твоя персональная ссылка:\n<code>{esc(link)}</code>\n\n"
+            f"Уже приглашено: <b>{invited}</b> чел.\n\n"
+            f"Каждый друг, который запустит бота по твоей ссылке, засчитывается автоматически."
+        )
+        keyboard = Keyboards.simple_nav(refresh_callback="invite")
+        return (text, keyboard)
+
+    def _render_rules(self) -> tuple:
+        text = (
+            f"📜 <b>Правила сообщества ОБНУЛЕННЫЙ</b>\n{DIVIDER}\n\n"
+            f"1️⃣ Уважение — без токсичности, оскорблений и переходов на личности\n"
+            f"2️⃣ Никаких сигналов и «гарантированных иксов» — только аргументированное мнение\n"
+            f"3️⃣ Реклама и рефссылки — только по согласованию с модераторами\n"
+            f"4️⃣ Финансовые решения — твоя ответственность\n"
+            f"5️⃣ Флуд и спам — предупреждение, потом бан\n{DIVIDER}\n"
+            f"Нарушения — пишите модераторам. Всем трезвых решений! 🧊"
+        )
+        return (text, Keyboards.simple_nav())
+
+    def _render_help(self) -> tuple:
+        text = (
+            f"📖 <b>СПРАВКА</b>\n{DIVIDER}\n\n"
+            f"Всё управляется кнопками — жми /start и выбирай нужное в меню.\n"
+            f"Для тех, кто любит печатать, команды тоже работают:\n\n"
+            f"/analyze [монета], /price [монета], /compare [c1] [c2], /top\n"
+            f"/ta [монета], /exchanges [тикер], /screener, /news [монета]\n"
+            f"/community, /invite, /rules\n\n"
+            f"Продвинутая аналитика (ТА/биржи/скринер/новости) — {FREE_DAILY_ADVANCED_LIMIT} бесплатных запроса в день, "
+            f"дальше — тариф Standard.\n{DIVIDER}"
+        )
+        return (text, Keyboards.main_menu())
+
+    # ---------- Диспетчер ----------
+
+    async def _dispatch(self, action: str, token: str, user_id: int, quote: str = 'USDT') -> dict:
+        """Единая точка рендера + лимитов для монето-ориентированных действий"""
+        if action == 'analyze':
+            text, keyboard = await self._render_analyze(token)
+            within, used = self._check_and_bump_limit(user_id, 'analyze', FREE_DAILY_ANALYZE_LIMIT)
+            if not within:
+                text += self._upsell_footer(used, FREE_DAILY_ANALYZE_LIMIT)
+            return {'text': text, 'keyboard': keyboard, 'photo': None}
+
+        if action == 'price':
+            text, keyboard = await self._render_price(token)
+            return {'text': text, 'keyboard': keyboard, 'photo': None}
+
+        if action == 'ta':
+            text, keyboard, photo = await self._render_ta(token)
+            within, used = self._check_and_bump_limit(user_id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
+            if not within:
+                text += self._upsell_footer(used, FREE_DAILY_ADVANCED_LIMIT)
+            return {'text': text, 'keyboard': keyboard, 'photo': photo}
+
+        if action == 'exchanges':
+            text, keyboard = await self._render_exchanges(token, quote)
+            within, used = self._check_and_bump_limit(user_id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
+            if not within:
+                text += self._upsell_footer(used, FREE_DAILY_ADVANCED_LIMIT)
+            return {'text': text, 'keyboard': keyboard, 'photo': None}
+
+        if action == 'news':
+            text, keyboard = await self._render_news(token)
+            within, used = self._check_and_bump_limit(user_id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
+            if not within:
+                text += self._upsell_footer(used, FREE_DAILY_ADVANCED_LIMIT)
+            return {'text': text, 'keyboard': keyboard, 'photo': None}
+
+        return None
+
+    async def _send_result(self, message, result: dict):
+        if result['photo']:
+            await message.reply_photo(photo=result['photo'], caption=result['text'],
+                                       parse_mode=ParseMode.HTML, reply_markup=result['keyboard'])
+        else:
+            await message.reply_text(result['text'], parse_mode=ParseMode.HTML,
+                                      reply_markup=result['keyboard'], disable_web_page_preview=True)
+
+    async def _edit_or_send(self, query, text: str, keyboard: InlineKeyboardMarkup):
+        try:
+            if query.message.photo:
+                # Исходное сообщение — фото (например, после /ta), в текст его не превратить
+                await query.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                reply_markup=keyboard, disable_web_page_preview=True)
+            else:
+                await query.edit_message_text(text, parse_mode=ParseMode.HTML,
+                                               reply_markup=keyboard, disable_web_page_preview=True)
+        except BadRequest as e:
+            if 'Message is not modified' not in str(e):
+                await query.message.reply_text(text, parse_mode=ParseMode.HTML,
+                                                reply_markup=keyboard, disable_web_page_preview=True)
+
+    async def _deliver(self, query, result: dict):
+        keyboard, text, photo = result['keyboard'], result['text'], result['photo']
+        if photo:
+            media = InputMediaPhoto(media=photo, caption=text, parse_mode=ParseMode.HTML)
+            try:
+                if query.message.photo:
+                    await query.edit_message_media(media=media, reply_markup=keyboard)
+                else:
+                    await query.message.reply_photo(photo=photo, caption=text,
+                                                      parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            except BadRequest:
+                await query.message.reply_photo(photo=photo, caption=text,
+                                                  parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        else:
+            await self._edit_or_send(query, text, keyboard)
+
+    # ---------- Callback-роутинг (кнопки) ----------
+
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        query = update.callback_query
+        data = query.data or ""
+        user_id = update.effective_user.id
+        await query.answer()
+
+        if data == 'menu':
+            text = "🧊 <b>ОБНУЛЕННЫЙ</b>\n<i>Трезвая крипто-аналитика без хайпа</i>\n\nВыбери, что нужно 👇"
+            await self._edit_or_send(query, text, Keyboards.main_menu())
+            return
+
+        if data.startswith('pick:'):
+            action = data.split(':', 1)[1]
+            prompt = PICK_PROMPTS.get(action, "Выбери монету:")
+            await self._edit_or_send(query, prompt, Keyboards.coin_picker(action))
+            return
+
+        if data.startswith('custom:'):
+            action = data.split(':', 1)[1]
+            context.user_data['awaiting'] = action
+            await self._edit_or_send(
+                query,
+                "✏️ Напиши тикер или название монеты следующим сообщением (например: <code>btc</code>).",
+                Keyboards.simple_nav(),
+            )
+            return
+
+        if data == 'cmp_pick':
+            await self._edit_or_send(query, "⚖️ <b>Сравнение</b>\nВыбери пару или введи свои:",
+                                      Keyboards.compare_picker())
+            return
+
+        if data.startswith('cmp:'):
+            _, c1, c2 = data.split(':', 2)
+            text, keyboard = await self._render_compare(c1, c2)
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'cmp_custom':
+            context.user_data['awaiting'] = 'compare'
+            await self._edit_or_send(
+                query,
+                "✏️ Напиши две монеты через пробел следующим сообщением (например: <code>bitcoin ethereum</code>).",
+                Keyboards.simple_nav(),
+            )
+            return
+
+        if data == 'top':
+            text, keyboard = await self._render_top()
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'screener':
+            text, keyboard = await self._render_screener()
+            within, used = self._check_and_bump_limit(user_id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
+            if not within:
+                text += self._upsell_footer(used, FREE_DAILY_ADVANCED_LIMIT)
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'community':
+            text, keyboard = self._render_community()
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'invite':
+            text, keyboard = await self._render_invite(user_id, context)
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'rules':
+            text, keyboard = self._render_rules()
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data == 'help':
+            text, keyboard = self._render_help()
+            await self._edit_or_send(query, text, keyboard)
+            return
+
+        if data.startswith('go:'):
+            _, action, token = data.split(':', 2)
+            result = await self._dispatch(action, token, user_id)
+            if result is None:
+                await query.answer("Неизвестное действие", show_alert=True)
+                return
+            await self._deliver(query, result)
+            return
+
+    # ---------- Текстовый ввод произвольной монеты ----------
+
+    async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        awaiting = context.user_data.get('awaiting')
+        if not awaiting:
+            return  # обычное сообщение вне диалога (например, в групповом чате) — не мешаем
+
+        context.user_data['awaiting'] = None
+        text_in = (update.message.text or "").strip()
+        user_id = update.effective_user.id
+
+        if awaiting == 'compare':
+            parts = text_in.lower().split()
+            if len(parts) < 2:
+                await update.message.reply_text(
+                    "❌ Нужно две монеты через пробел, например: <code>bitcoin ethereum</code>",
+                    parse_mode=ParseMode.HTML, reply_markup=Keyboards.simple_nav(),
+                )
+                return
+            c1 = await self._resolve_coin_id(parts[0]) or parts[0]
+            c2 = await self._resolve_coin_id(parts[1]) or parts[1]
+            text_out, keyboard = await self._render_compare(c1, c2)
+            await update.message.reply_text(text_out, parse_mode=ParseMode.HTML,
+                                             reply_markup=keyboard, disable_web_page_preview=True)
+            return
+
+        if awaiting == 'exchanges':
+            token = text_in.upper()
+        else:
+            resolved = await self._resolve_coin_id(text_in.lower())
+            token = resolved or text_in.lower()
+
+        result = await self._dispatch(awaiting, token, user_id)
+        if result is None:
+            await update.message.reply_text("❌ Не удалось обработать запрос", reply_markup=Keyboards.simple_nav())
+            return
+        await self._send_result(update.message, result)
+
+    # ---------- Команды (для тех, кто печатает руками) ----------
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /start (в т.ч. обработка реферальных ссылок вида /start ref_12345)"""
         user_id = update.effective_user.id
         record = self._get_user_record(user_id)
 
@@ -548,573 +1226,125 @@ class CryptoBot:
                 referred_note = "\n🎁 Ты пришёл по приглашению — добро пожаловать в семью ОБНУЛЕННЫЙ!\n"
         save_data(self.data)
 
-        community_line = (
-            f"Используй бота чтобы быстро анализировать проекты, а в чате {COMMUNITY_CHAT_URL} "
-            f"и канале {COMMUNITY_CHANNEL_URL} — общайся с сообществом 📊"
-            if COMMUNITY_CHANNEL_URL else
-            f"Используй бота чтобы быстро анализировать проекты, а в чате {COMMUNITY_CHAT_URL} — общайся с сообществом 📊"
+        text = (
+            f"🧊 <b>ОБНУЛЕННЫЙ</b>\n"
+            f"<i>Трезвая крипто-аналитика без хайпа</i>\n{referred_note}\n"
+            f"Разборы, технический анализ, мультибиржевые цены, скринер и новости — всё в пару кликов, "
+            f"без ручного набора команд.\n\n"
+            f"Выбери, что нужно 👇"
         )
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=Keyboards.main_menu())
 
-        welcome_message = f"""
-🚀 **Добро пожаловать в ОБНУЛЕННЫЙ анализатор!**
-{referred_note}
-Я помогаю анализировать крипто-проекты и делать умные инвестиции.
-
-**Доступные команды:**
-/analyze [монета] - Полный анализ проекта
-/price [монета] - Быстрая цена
-/compare [coin1] [coin2] - Сравнение двух монет
-/top - Топ 20 монет по объёму
-/ta [монета] - Технический анализ (MACD/Bollinger/RSI/SMA)
-/exchanges [тикер] - Цена на нескольких биржах
-/screener - Перепроданные/перекупленные монеты
-/news [монета] - Свежие новости
-/community - О сообществе и тарифах
-/invite - Пригласить друзей
-/rules - Правила сообщества
-/help - Справка
-
-**Примеры:**
-/analyze bitcoin
-/price ethereum
-/compare bitcoin ethereum
-
-{community_line}
-        """
-        await update.message.reply_text(welcome_message.strip(), parse_mode='Markdown', disable_web_page_preview=True)
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        text, keyboard = self._render_help()
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     async def community(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /community — о сообществе и тарифах"""
-        links_block = f"💬 Чат: {COMMUNITY_CHAT_URL}"
-        if COMMUNITY_CHANNEL_URL:
-            links_block += f"\n📢 Канал: {COMMUNITY_CHANNEL_URL}"
-
-        text = f"""
-🧭 **ОБНУЛЕННЫЙ — сообщество трезвых крипто-инвесторов**
-
-Без сигналов "купи на хаях". Только данные, риск-скоринг и живое обсуждение.
-
-{links_block}
-
-**Тарифы:**
-
-🆓 **Free**
-Чат, /price, /top, {FREE_DAILY_ANALYZE_LIMIT} разбора /analyze и {FREE_DAILY_ADVANCED_LIMIT} премиум-запроса (/ta, /exchanges, /screener, /news) в день
-
-⭐ **Standard** (~700-900 ₽/мес)
-Безлимит /analyze, /compare, /ta, /exchanges, /screener, /news, ежедневный дайджест рынка, приоритет в чате
-
-💎 **Pro** (~2000-2500 ₽/мес)
-Всё из Standard + закрытый чат с разборами портфелей, доступ к экспертам, ранний доступ к обзорам
-
-Оплата — через Telegram Stars прямо в боте (скоро).
-Хочешь пригласить друзей и получить бонус? Жми /invite 🎁
-        """
-        await update.message.reply_text(text.strip(), parse_mode='Markdown', disable_web_page_preview=True)
+        text, keyboard = self._render_community()
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                         disable_web_page_preview=True)
 
     async def invite(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /invite — персональная реферальная ссылка"""
-        user_id = update.effective_user.id
-        record = self._get_user_record(user_id)
-        save_data(self.data)
-
-        username = self.bot_username or (await context.bot.get_me()).username
-        link = f"https://t.me/{username}?start=ref_{user_id}"
-        invited = record.get('invited_count', 0)
-
-        text = f"""
-🎁 **Приглашай друзей в ОБНУЛЕННЫЙ**
-
-Твоя персональная ссылка:
-{link}
-
-Уже приглашено: **{invited}** чел.
-
-Каждый друг, который запустит бота по твоей ссылке, засчитывается автоматически.
-        """
-        await update.message.reply_text(text.strip(), parse_mode='Markdown', disable_web_page_preview=True)
+        text, keyboard = await self._render_invite(update.effective_user.id, context)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                         disable_web_page_preview=True)
 
     async def rules(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /rules — правила сообщества"""
-        text = """
-📜 **Правила сообщества ОБНУЛЕННЫЙ**
-
-1️⃣ Уважение — без токсичности, оскорблений и переходов на личности
-2️⃣ Никаких сигналов и "гарантированных иксов" — только аргументированное мнение
-3️⃣ Реклама и рефссылки — только по согласованию с модераторами
-4️⃣ Финансовые решения — твоя ответственность. Мы делимся данными, а не советами "инвестировать всё"
-5️⃣ Флуд и спам — предупреждение, потом бан
-
-Нарушения — пишите модераторам. Всем удачи и трезвых решений! 🧊
-        """
-        await update.message.reply_text(text.strip(), parse_mode='Markdown')
+        text, keyboard = self._render_rules()
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     async def welcome_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Приветствие новых участников в чате/группе"""
         for member in update.message.new_chat_members:
             if member.is_bot:
                 continue
-            name = member.first_name or member.username or "друг"
-            text = f"""
-👋 Привет, {name}! Добро пожаловать в чат ОБНУЛЕННЫЙ.
-
-Здесь мы разбираем крипто-проекты трезво, без хайпа. Загляни в /rules, а личного бота-аналитика найдёшь тут: @{self.bot_username or ''}
-            """
-            await update.message.reply_text(text.strip(), parse_mode='Markdown')
-
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда /help"""
-        help_text = """
-📖 **СПРАВКА**
-
-**Основные команды:**
-
-1️⃣ /analyze [монета]
-   Полный анализ проекта с данными о цене, рисках, изменениях
-   Пример: /analyze bitcoin
-
-2️⃣ /price [монета]
-   Быстрая информация о цене и рыночных данных
-   Пример: /price ethereum
-
-3️⃣ /compare [coin1] [coin2]
-   Сравнение двух монет
-   Пример: /compare bitcoin ethereum
-
-4️⃣ /top
-   Топ 20 монет по объёму торгов
-   Пример: /top
-
-**Продвинутая аналитика (2 бесплатных запроса в день):**
-
-5️⃣ /ta [монета]
-   Технический анализ: RSI, SMA20, MACD, Bollinger Bands + вердикт
-   Пример: /ta bitcoin
-
-6️⃣ /exchanges [тикер] [quote]
-   Цена и объём монеты на Binance/Bybit/Kraken/OKX
-   Пример: /exchanges BTC USDT
-
-7️⃣ /screener
-   Топ-15 монет по объёму, отфильтрованные по RSI (перепроданность/перекупленность)
-
-8️⃣ /news [монета]
-   Свежие заголовки новостей по теме
-   Пример: /news ethereum
-
-**Сообщество:**
-🧭 /community — о сообществе ОБНУЛЕННЫЙ и тарифах
-🎁 /invite — персональная ссылка для приглашения друзей
-📜 /rules — правила сообщества
-
-**Поиск монет:**
-Название можно писать на английском:
-- bitcoin, ethereum, solana, cardano
-- doge, ripple, polkadot, chainlink
-
-**Советы:**
-✅ Всегда проверяй риск перед инвестицией
-✅ Смотри на объём торгов (Volume)
-✅ Анализируй рыночную капитализацию (Market Cap)
-✅ Не покупай на пике 📈
-
-Вопросы? Напиши в личку! 💬
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+            name = esc(member.first_name or member.username or "друг")
+            text = (
+                f"👋 Привет, {name}! Добро пожаловать в чат ОБНУЛЕННЫЙ.\n\n"
+                f"Здесь мы разбираем крипто-проекты трезво, без хайпа. Правила — /rules, "
+                f"а личного бота-аналитика найдёшь тут: @{self.bot_username or ''}"
+            )
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
     async def analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Полный анализ монеты"""
         if not context.args:
-            await update.message.reply_text(
-                "❌ Укажи монету\nПример: /analyze bitcoin",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('analyze'))
             return
-
-        coin_name = ' '.join(context.args).lower()
-
-        # Показываем, что обрабатываем
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        # Получаем данные
-        market_data = self.analyzer.get_market_data(coin_name)
-        full_data = self.analyzer.get_coin_data(coin_name)
-
-        if not market_data or not full_data:
-            # Ищем монету
-            search_results = self.analyzer.search_coin(coin_name)
-            if search_results:
-                suggestion = search_results[0]
-                suggested_id = suggestion['id']
-                suggested_name = suggestion['name']
-
-                market_data = self.analyzer.get_market_data(suggested_id)
-                full_data = self.analyzer.get_coin_data(suggested_id)
-                coin_name = suggested_id
-            else:
-                await update.message.reply_text(
-                    f"❌ Монета '{coin_name}' не найдена\n/help для справки",
-                    parse_mode='Markdown'
-                )
-                return
-
-        analysis = self.analyzer.format_analysis(coin_name, coin_name, market_data, full_data)
-
-        within_free_limit, used_today = self._check_and_bump_free_limit(update.effective_user.id)
-        if not within_free_limit:
-            analysis += (
-                f"\n\n🔒 Бесплатных разборов на сегодня: {FREE_DAILY_ANALYZE_LIMIT}/{FREE_DAILY_ANALYZE_LIMIT} использовано.\n"
-                f"Безлимит и приоритет — в тарифе Standard: /community"
-            )
-
-        await update.message.reply_text(analysis, parse_mode='Markdown')
+        coin_id = await self._resolve_coin_id(' '.join(context.args).lower())
+        if not coin_id:
+            await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
+            return
+        result = await self._dispatch('analyze', coin_id, update.effective_user.id)
+        await self._send_result(update.message, result)
 
     async def price(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Быстрая цена"""
         if not context.args:
-            await update.message.reply_text(
-                "❌ Укажи монету\nПример: /price bitcoin",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('price'))
             return
-
-        coin_name = ' '.join(context.args).lower()
-
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        market_data = self.analyzer.get_market_data(coin_name)
-
-        if not market_data:
-            search_results = self.analyzer.search_coin(coin_name)
-            if search_results:
-                coin_name = search_results[0]['id']
-                market_data = self.analyzer.get_market_data(coin_name)
-            else:
-                await update.message.reply_text(f"❌ '{coin_name}' не найдена")
-                return
-
-        price = market_data.get('usd', 0)
-        change_24h = market_data.get('usd_24h_change', 0)
-
-        emoji = "📈" if change_24h >= 0 else "📉"
-        formatted_price = self.analyzer.format_price(price)
-
-        message = f"""
-💰 **{coin_name.upper()}**
-Цена: {formatted_price}
-{emoji} 24h: {change_24h:+.2f}%
-        """
-        await update.message.reply_text(message.strip(), parse_mode='Markdown')
+        coin_id = await self._resolve_coin_id(' '.join(context.args).lower())
+        if not coin_id:
+            await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
+            return
+        result = await self._dispatch('price', coin_id, update.effective_user.id)
+        await self._send_result(update.message, result)
 
     async def compare(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сравнение двух монет"""
         if len(context.args) < 2:
-            await update.message.reply_text(
-                "❌ Укажи две монеты\nПример: /compare bitcoin ethereum",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text("Выбери пару для сравнения:", reply_markup=Keyboards.compare_picker())
             return
-
-        coin1_name = context.args[0].lower()
-        coin2_name = context.args[1].lower()
-
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        # Получаем данные обеих монет
-        data1 = self.analyzer.get_market_data(coin1_name)
-        data2 = self.analyzer.get_market_data(coin2_name)
-
-        if not data1 or not data2:
-            await update.message.reply_text("❌ Не удалось найти одну или обе монеты")
-            return
-
-        price1 = data1.get('usd', 0)
-        price2 = data2.get('usd', 0)
-        change1 = data1.get('usd_24h_change', 0)
-        change2 = data2.get('usd_24h_change', 0)
-        cap1 = data1.get('usd_market_cap')
-        cap2 = data2.get('usd_market_cap')
-
-        cap1_str = f"${cap1/1_000_000_000:.2f}B" if cap1 else 'N/A'
-        cap2_str = f"${cap2/1_000_000_000:.2f}B" if cap2 else 'N/A'
-
-        message = f"""
-⚖️ **СРАВНЕНИЕ**
-
-💰 {coin1_name.upper()}
-   Цена: {self.analyzer.format_price(price1)}
-   24h: {change1:+.2f}%
-   Market Cap: {cap1_str}
-
-💰 {coin2_name.upper()}
-   Цена: {self.analyzer.format_price(price2)}
-   24h: {change2:+.2f}%
-   Market Cap: {cap2_str}
-
-🏆 Лидер по изменениям (24h): {coin1_name if abs(change1) > abs(change2) else coin2_name}
-        """
-        await update.message.reply_text(message.strip(), parse_mode='Markdown')
+        c1 = await self._resolve_coin_id(context.args[0].lower()) or context.args[0].lower()
+        c2 = await self._resolve_coin_id(context.args[1].lower()) or context.args[1].lower()
+        text, keyboard = await self._render_compare(c1, c2)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard,
+                                         disable_web_page_preview=True)
 
     async def top_coins(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Топ 20 монет"""
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        try:
-            url = f'{COINGECKO_API}/coins/markets'
-            params = {
-                'vs_currency': 'usd',
-                'order': 'volume_desc',
-                'per_page': 20,
-                'sparkline': False,
-                'locale': 'en'
-            }
-            response = requests.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            coins = response.json()
-
-            message = "🔝 **ТОП 20 МОНЕТ ПО ОБЪЁМУ**\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-
-            for i, coin in enumerate(coins, 1):
-                name = coin['name']
-                symbol = coin['symbol'].upper()
-                price = coin['current_price']
-                volume = coin['total_volume']
-                change = coin['price_change_percentage_24h'] or 0
-
-                emoji = "📈" if change >= 0 else "📉"
-
-                price_str = self.analyzer.format_price(price)
-
-                if volume and volume >= 1_000_000_000:
-                    vol_str = f"${volume/1_000_000_000:.2f}B"
-                elif volume:
-                    vol_str = f"${volume/1_000_000:.2f}M"
-                else:
-                    vol_str = "N/A"
-
-                message += f"{i}. {name} ({symbol})\n   {price_str} {emoji} {change:+.2f}% | Vol: {vol_str}\n\n"
-
-            await update.message.reply_text(message.strip(), parse_mode='Markdown')
-        except Exception as e:
-            await update.message.reply_text(f"❌ Ошибка при получении топа: {str(e)}")
-
-    def _upsell_footer(self, used_today: int, limit: int) -> str:
-        return (
-            f"\n\n🔒 Премиум-запросов на сегодня: {used_today}/{limit} использовано.\n"
-            f"Безлимит на /ta, /exchanges, /screener, /news — в тарифе Standard: /community"
-        )
+        text, keyboard = await self._render_top()
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     async def ta(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Технический анализ монеты: SMA/EMA/MACD/Bollinger/RSI"""
         if not context.args:
-            await update.message.reply_text("❌ Укажи монету\nПример: /ta bitcoin", parse_mode='Markdown')
+            await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('ta'))
             return
-
-        coin_name = ' '.join(context.args).lower()
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        prices = TechnicalAnalyzer.get_price_history(coin_name, days=100)
-        if not prices:
-            search_results = self.analyzer.search_coin(coin_name)
-            if search_results:
-                coin_name = search_results[0]['id']
-                prices = TechnicalAnalyzer.get_price_history(coin_name, days=100)
-            if not prices:
-                await update.message.reply_text(f"❌ Не удалось получить историю цен для '{coin_name}'")
-                return
-
-        summary = TechnicalAnalyzer.summarize(prices)
-        if 'error' in summary:
-            await update.message.reply_text(f"❌ {summary['error']}")
+        coin_id = await self._resolve_coin_id(' '.join(context.args).lower())
+        if not coin_id:
+            await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
             return
-
-        rsi_str = f"{summary['rsi']:.1f}" if summary['rsi'] is not None else "н/д"
-        sma_str = self.analyzer.format_price(summary['sma20']) if summary['sma20'] else "н/д"
-        if summary['macd']:
-            macd_str = f"{summary['macd']['macd']:.4f} / сигнал {summary['macd']['signal']:.4f}"
-        else:
-            macd_str = "н/д (мало данных)"
-        if summary['bollinger']:
-            bb = summary['bollinger']
-            bb_str = f"{self.analyzer.format_price(bb['lower'])} — {self.analyzer.format_price(bb['upper'])}"
-        else:
-            bb_str = "н/д"
-
-        text = f"""
-📐 **ТЕХНИЧЕСКИЙ АНАЛИЗ: {coin_name.upper()}**
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-RSI (14): {rsi_str}
-SMA (20): {sma_str}
-MACD: {macd_str}
-Bollinger Bands: {bb_str}
-
-{summary['verdict']}
-Сигналы: {', '.join(summary['reasons']) if summary['reasons'] else 'недостаточно данных'}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━
-⚠️ Это не финансовый совет, а сводка индикаторов на исторических данных.
-"""
-        within_limit, used_today = self._check_and_bump_limit(update.effective_user.id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
-        if not within_limit:
-            text += self._upsell_footer(used_today, FREE_DAILY_ADVANCED_LIMIT)
-
-        await update.message.reply_text(text.strip(), parse_mode='Markdown')
+        result = await self._dispatch('ta', coin_id, update.effective_user.id)
+        await self._send_result(update.message, result)
 
     async def exchanges(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Сравнение цены/объёма монеты на нескольких биржах (ccxt)"""
         if not context.args:
-            await update.message.reply_text("❌ Укажи тикер\nПример: /exchanges BTC", parse_mode='Markdown')
+            await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('exchanges'))
             return
-
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         ticker = context.args[0].upper()
         quote = context.args[1].upper() if len(context.args) > 1 else 'USDT'
-        symbol = f"{ticker}/{quote}"
-
-        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        loop = asyncio.get_running_loop()
-        results = await loop.run_in_executor(None, ExchangeAggregator.fetch_all_sync, symbol)
-
-        lines = [f"🏦 **{symbol} НА БИРЖАХ**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-        prices = {}
-        for ex_id, data in results.items():
-            if 'error' in data or not data.get('price'):
-                lines.append(f"{ex_id.capitalize()}: н/д (пара не найдена или недоступна)")
-                continue
-            price = data['price']
-            prices[ex_id] = price
-            vol = data.get('volume')
-            vol_str = f", объём: {self.analyzer.format_price(vol)}" if vol else ""
-            lines.append(f"{ex_id.capitalize()}: {self.analyzer.format_price(price)}{vol_str}")
-
-        if len(prices) >= 2:
-            max_ex = max(prices, key=prices.get)
-            min_ex = min(prices, key=prices.get)
-            spread_pct = (prices[max_ex] - prices[min_ex]) / prices[min_ex] * 100
-            lines.append("")
-            lines.append(f"📊 Разброс цен: {spread_pct:.2f}% ({min_ex.capitalize()} → {max_ex.capitalize()})")
-        elif not prices:
-            lines.append("")
-            lines.append("Не удалось получить данные ни с одной биржи — проверь тикер.")
-
-        lines.append("")
-        lines.append("⚠️ Не является рекомендацией к арбитражу или сделкам.")
-
-        within_limit, used_today = self._check_and_bump_limit(update.effective_user.id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
-        text = "\n".join(lines)
-        if not within_limit:
-            text += self._upsell_footer(used_today, FREE_DAILY_ADVANCED_LIMIT)
-
-        await update.message.reply_text(text, parse_mode='Markdown')
+        result = await self._dispatch('exchanges', ticker, update.effective_user.id, quote=quote)
+        await self._send_result(update.message, result)
 
     async def screener(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Скринер топ-монет по объёму: ищем перепроданные/перекупленные по RSI + тренд к SMA20"""
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        try:
-            url = f'{COINGECKO_API}/coins/markets'
-            params = {
-                'vs_currency': 'usd',
-                'order': 'volume_desc',
-                'per_page': 15,
-                'sparkline': True,
-                'price_change_percentage': '24h',
-                'locale': 'en',
-            }
-            response = requests.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            coins = response.json()
-        except requests.exceptions.RequestException as e:
-            await update.message.reply_text(f"❌ Ошибка при получении данных скринера: {str(e)}")
-            return
-
-        oversold, overbought, neutral_count = [], [], 0
-        for coin in coins:
-            sparkline = (coin.get('sparkline_in_7d') or {}).get('price') or []
-            if len(sparkline) < 20:
-                continue
-            rsi = CryptoAnalyzer.calculate_rsi(sparkline, period=14)
-            sma20 = TechnicalAnalyzer.sma(sparkline, 20)
-            if rsi is None:
-                continue
-            symbol = coin['symbol'].upper()
-            price = coin['current_price']
-            if rsi < 35:
-                oversold.append((symbol, rsi, price))
-            elif rsi > 65:
-                overbought.append((symbol, rsi, price))
-            else:
-                neutral_count += 1
-
-        lines = ["🔍 **СКРИНЕР (ТОП-15 ПО ОБЪЁМУ)**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-
-        lines.append("🟢 Перепроданные (RSI < 35) — потенциальный интерес к отскоку:")
-        if oversold:
-            for symbol, rsi, price in sorted(oversold, key=lambda x: x[1]):
-                lines.append(f"   {symbol}: RSI {rsi:.0f}, {self.analyzer.format_price(price)}")
-        else:
-            lines.append("   Нет совпадений")
-
-        lines.append("")
-        lines.append("🔴 Перекупленные (RSI > 65) — риск коррекции:")
-        if overbought:
-            for symbol, rsi, price in sorted(overbought, key=lambda x: -x[1]):
-                lines.append(f"   {symbol}: RSI {rsi:.0f}, {self.analyzer.format_price(price)}")
-        else:
-            lines.append("   Нет совпадений")
-
-        lines.append("")
-        lines.append(f"⚪ Нейтральных: {neutral_count}")
-        lines.append("")
-        lines.append("⚠️ RSI считается по 7-дневным данным — сигнал для дальнейшей проверки через /ta, не сигнал к сделке.")
-
-        within_limit, used_today = self._check_and_bump_limit(update.effective_user.id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
-        text = "\n".join(lines)
-        if not within_limit:
-            text += self._upsell_footer(used_today, FREE_DAILY_ADVANCED_LIMIT)
-
-        await update.message.reply_text(text, parse_mode='Markdown')
+        text, keyboard = await self._render_screener()
+        within, used = self._check_and_bump_limit(update.effective_user.id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
+        if not within:
+            text += self._upsell_footer(used, FREE_DAILY_ADVANCED_LIMIT)
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
     async def news(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Свежие новости по монете/ключевому слову"""
         if not context.args:
-            await update.message.reply_text("❌ Укажи монету\nПример: /news bitcoin", parse_mode='Markdown')
+            await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('news'))
             return
-
-        keyword = ' '.join(context.args)
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
-        loop = asyncio.get_running_loop()
-        items = await loop.run_in_executor(None, NewsService.get_news, keyword, 5)
-
-        if not items:
-            await update.message.reply_text(f"❌ Не удалось получить новости по '{keyword}'")
-            return
-
-        lines = [f"📰 **НОВОСТИ: {keyword.upper()}**", "━━━━━━━━━━━━━━━━━━━━━━━━━━━", ""]
-        for item in items:
-            title = item.get('title', 'Без заголовка')
-            source = item.get('source_info', {}).get('name') or item.get('source', '')
-            url = item.get('url', '')
-            lines.append(f"• {title}")
-            if source:
-                lines.append(f"  Источник: {source}")
-            if url:
-                lines.append(f"  {url}")
-            lines.append("")
-
-        lines.append("⚠️ Заголовки без редактуры — проверяй первоисточник перед выводами.")
-
-        within_limit, used_today = self._check_and_bump_limit(update.effective_user.id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
-        text = "\n".join(lines)
-        if not within_limit:
-            text += self._upsell_footer(used_today, FREE_DAILY_ADVANCED_LIMIT)
-
-        await update.message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
+        keyword = ' '.join(context.args)
+        result = await self._dispatch('news', keyword, update.effective_user.id)
+        await self._send_result(update.message, result)
 
     def run(self):
-        """Запустить бота"""
         logger.info("🚀 Бот запускается...")
         self.app.run_polling(
             allowed_updates=Update.ALL_TYPES,
