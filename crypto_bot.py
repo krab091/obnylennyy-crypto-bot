@@ -508,6 +508,20 @@ class NewsService:
         """Последние новости без фильтра по ключевому слову — для автопостинга"""
         return NewsService.get_news('', limit)
 
+    @staticmethod
+    def translate_ru(text: str) -> str:
+        """Перевод заголовка на русский (deep-translator/Google, без API-ключа).
+        При любой ошибке (сеть, лимиты) тихо возвращает оригинал — заголовок важнее перевода."""
+        if not text:
+            return text
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source='en', target='ru').translate(text[:4500])
+            return translated or text
+        except Exception as e:
+            logger.warning(f"Не удалось перевести заголовок: {e}")
+            return text
+
 
 class Keyboards:
     """Инлайн-клавиатуры бота — вся навигация кнопками, без ручного ввода команд"""
@@ -1024,19 +1038,25 @@ class CryptoBot:
         if not items:
             return (f"❌ Не удалось получить новости по «{esc(keyword)}»", Keyboards.simple_nav())
 
+        # Переводим заголовки на русский параллельно (перевод — сеть, не блокируем event loop)
+        translations = await asyncio.gather(*[
+            loop.run_in_executor(None, NewsService.translate_ru, item.get('title') or '')
+            for item in items
+        ])
+
         lines = [f"📰 <b>НОВОСТИ: {esc(keyword.upper())}</b>", DIVIDER, ""]
-        for item in items:
-            title = esc(item.get('title') or 'Без заголовка')
+        for item, title_ru in zip(items, translations):
+            title = esc(title_ru or item.get('title') or 'Без заголовка')
             source = esc(item.get('source', ''))
             url = item.get('url', '')
             lines.append(f"• <b>{title}</b>")
             if source:
-                lines.append(f"  {source}")
+                lines.append(f"  <i>{source}</i>")
             if url:
-                lines.append(f'  <a href="{esc(url)}">Читать →</a>')
+                lines.append(f'  🔗 <a href="{esc(url)}">Источник (оригинал, EN) →</a>')
             lines.append("")
 
-        lines.append("⚠️ Заголовки без редактуры — проверяй первоисточник.")
+        lines.append("⚠️ Заголовки переведены автоматически — проверяй первоисточник.")
         lines.append(DIVIDER)
 
         text = "\n".join(lines)
@@ -1462,25 +1482,30 @@ class CryptoBot:
                     return coin_id, symbol
         return None
 
-    def _render_news_post(self, item: dict) -> tuple:
-        """Автоформатирование карточки поста из новости для публикации в группе"""
-        title = esc(item.get('title') or 'Новость')
+    async def _render_news_post(self, item: dict) -> tuple:
+        """Автоформатирование карточки поста из новости для публикации в группе.
+        Заголовок — на русском (перевод), ссылка на оригинал — в конце поста."""
+        loop = asyncio.get_running_loop()
+        original_title = item.get('title') or 'Новость'
+        title_ru = await loop.run_in_executor(None, NewsService.translate_ru, original_title)
+        title = esc(title_ru or original_title)
         source = esc(item.get('source', ''))
         url = item.get('url', '')
-        matched = self._match_coin_in_title(item.get('title', ''))
+        matched = self._match_coin_in_title(original_title)
 
         tag = f" #{matched[1]}" if matched else ""
         text = f"📰 <b>{title}</b>{tag}\n{DIVIDER}\n<i>{source}</i>"
 
         buttons = []
-        if url:
-            buttons.append([InlineKeyboardButton("Читать полностью →", url=url)])
         if matched:
             coin_id, symbol = matched
             buttons.append([
                 InlineKeyboardButton(f"📐 ТА {symbol}", callback_data=f"go:ta:{coin_id}"),
                 InlineKeyboardButton(f"📊 Анализ {symbol}", callback_data=f"go:analyze:{coin_id}"),
             ])
+        # Ссылка на источник — последней кнопкой, в самом конце поста
+        if url:
+            buttons.append([InlineKeyboardButton("🔗 Источник (оригинал, EN) →", url=url)])
         if self.bot_username:
             buttons.append([InlineKeyboardButton("🧊 Открыть бота", url=f"https://t.me/{self.bot_username}")])
 
@@ -1506,7 +1531,7 @@ class CryptoBot:
 
         # Публикуем от старых к новым — так лента в группе идёт в хронологическом порядке
         for item in reversed(new_items):
-            text, keyboard = self._render_news_post(item)
+            text, keyboard = await self._render_news_post(item)
             try:
                 await context.bot.send_message(
                     chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,

@@ -3,3 +3,4 @@ requests==2.34.2
 python-dotenv==1.0.0
 ccxt==4.5.65
 matplotlib==3.10.9
+deep-translator==1.9.1
