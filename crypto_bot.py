@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import io
 import json
@@ -7,7 +8,7 @@ import logging
 import requests
 from html import escape as esc
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 import matplotlib
 matplotlib.use('Agg')  # без графического дисплея (сервер/Railway)
@@ -502,6 +503,11 @@ class NewsService:
         result.sort(key=sort_key, reverse=True)
         return result[:limit]
 
+    @staticmethod
+    def get_latest(limit: int = 8) -> list:
+        """Последние новости без фильтра по ключевому слову — для автопостинга"""
+        return NewsService.get_news('', limit)
+
 
 class Keyboards:
     """Инлайн-клавиатуры бота — вся навигация кнопками, без ручного ввода команд"""
@@ -517,6 +523,7 @@ class Keyboards:
              InlineKeyboardButton("📰 Новости", callback_data="pick:news")],
             [InlineKeyboardButton("🔝 Топ-20", callback_data="top"),
              InlineKeyboardButton("⚖️ Сравнить", callback_data="cmp_pick")],
+            [InlineKeyboardButton("🔥 Тренды", callback_data="trending")],
             [InlineKeyboardButton("🧭 Сообщество", callback_data="community"),
              InlineKeyboardButton("🎁 Пригласить", callback_data="invite")],
             [InlineKeyboardButton("📜 Правила", callback_data="rules"),
@@ -551,6 +558,15 @@ class Keyboards:
         return InlineKeyboardMarkup(rows)
 
     @staticmethod
+    def _safe_token(action: str, raw_token: str) -> str:
+        """Telegram режет callback_data на 64 байтах. Длинные coin_id (встречаются у
+        малоизвестных монет из поиска) заменяем на 'cur' — фактическое значение бот
+        достаёт из context.user_data['cur_coin']/['cur_symbol'], куда оно кладётся
+        при каждом рендере карточки монеты."""
+        candidate = f"go:{action}:{raw_token}".encode('utf-8')
+        return raw_token if len(candidate) <= 60 else 'cur'
+
+    @staticmethod
     def coin_actions(current_action: str, coin_id: str, symbol: str = None) -> InlineKeyboardMarkup:
         """Связанные действия под карточкой монеты + Обновить/Меню"""
         symbol_token = (symbol or coin_id).upper()
@@ -561,7 +577,10 @@ class Keyboards:
             ('exchanges', '🏦 Биржи', symbol_token),
             ('news', '📰 Новости', coin_id),
         ]
-        related = [(label, f"go:{act}:{token}") for act, label, token in options if act != current_action]
+        related = [
+            (label, f"go:{act}:{Keyboards._safe_token(act, token)}")
+            for act, label, token in options if act != current_action
+        ]
 
         rows, row = [], []
         for label, cb in related:
@@ -572,7 +591,8 @@ class Keyboards:
         if row:
             rows.append(row)
 
-        refresh_token = symbol_token if current_action == 'exchanges' else coin_id
+        refresh_raw = symbol_token if current_action == 'exchanges' else coin_id
+        refresh_token = Keyboards._safe_token(current_action, refresh_raw)
         rows.append([
             InlineKeyboardButton("🔄 Обновить", callback_data=f"go:{current_action}:{refresh_token}"),
             InlineKeyboardButton("🔙 Меню", callback_data="menu"),
@@ -598,6 +618,7 @@ class CryptoBot:
         self.data = load_data()
         self.bot_username = None
         self._register_handlers()
+        self._schedule_jobs()
         self.app.add_error_handler(self._error_handler)
 
     async def _post_init(self, app: Application):
@@ -610,6 +631,7 @@ class CryptoBot:
             BotCommand("price", "Быстрая цена"),
             BotCommand("compare", "Сравнение двух монет"),
             BotCommand("top", "Топ 20 монет по объёму"),
+            BotCommand("trending", "В тренде за 24ч"),
             BotCommand("ta", "Технический анализ (MACD/Bollinger/RSI/SMA)"),
             BotCommand("exchanges", "Цена монеты на нескольких биржах"),
             BotCommand("screener", "Скринер: перепроданные/перекупленные монеты"),
@@ -617,6 +639,8 @@ class CryptoBot:
             BotCommand("community", "О сообществе ОБНУЛЕННЫЙ и тарифах"),
             BotCommand("invite", "Пригласить друзей и получить бонус"),
             BotCommand("rules", "Правила сообщества"),
+            BotCommand("setgroup", "[админ] Зарегистрировать группу для автопостинга новостей"),
+            BotCommand("autopost", "[админ] Вкл/выкл автопостинг новостей (on/off)"),
             BotCommand("help", "Справка"),
         ])
 
@@ -671,6 +695,7 @@ class CryptoBot:
         self.app.add_handler(CommandHandler("price", self.price))
         self.app.add_handler(CommandHandler("compare", self.compare))
         self.app.add_handler(CommandHandler("top", self.top_coins))
+        self.app.add_handler(CommandHandler("trending", self.trending))
         self.app.add_handler(CommandHandler("ta", self.ta))
         self.app.add_handler(CommandHandler("exchanges", self.exchanges))
         self.app.add_handler(CommandHandler("screener", self.screener))
@@ -678,9 +703,26 @@ class CryptoBot:
         self.app.add_handler(CommandHandler("community", self.community))
         self.app.add_handler(CommandHandler("invite", self.invite))
         self.app.add_handler(CommandHandler("rules", self.rules))
+        self.app.add_handler(CommandHandler("setgroup", self.setgroup))
+        self.app.add_handler(CommandHandler("autopost", self.autopost))
         self.app.add_handler(CallbackQueryHandler(self.on_callback))
         self.app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, self.welcome_new_member))
         self.app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_text))
+
+    def _schedule_jobs(self):
+        """Периодическая проверка новостей и автопостинг в группу сообщества"""
+        if self.app.job_queue is None:
+            logger.warning(
+                "JobQueue недоступен (нет extra 'job-queue' у python-telegram-bot) — "
+                "автопостинг новостей отключён."
+            )
+            return
+        self.app.job_queue.run_repeating(
+            self._news_autopost_job,
+            interval=timedelta(minutes=20),
+            first=timedelta(seconds=30),
+            name='news_autopost',
+        )
 
     # ---------- Резолв монеты ----------
 
@@ -817,6 +859,37 @@ class CryptoBot:
 
         text = "\n".join(lines)
         keyboard = Keyboards.simple_nav(refresh_callback="top")
+        return (text, keyboard)
+
+    async def _render_trending(self) -> tuple:
+        loop = asyncio.get_running_loop()
+        try:
+            def fetch():
+                url = f'{COINGECKO_API}/search/trending'
+                r = requests.get(url, timeout=10)
+                r.raise_for_status()
+                return r.json()
+
+            data = await loop.run_in_executor(None, fetch)
+        except Exception as e:
+            return (f"❌ Ошибка при получении трендов: {esc(str(e))}", Keyboards.simple_nav())
+
+        coins = (data.get('coins') or [])[:10]
+        if not coins:
+            return ("❌ Не удалось получить тренды", Keyboards.simple_nav())
+
+        lines = ["🔥 <b>В ТРЕНДЕ</b>", "<i>Что чаще всего искали за последние 24ч</i>", DIVIDER, ""]
+        for i, entry in enumerate(coins, 1):
+            item = entry.get('item', {})
+            name = esc(item.get('name', ''))
+            symbol = esc((item.get('symbol') or '').upper())
+            rank = item.get('market_cap_rank')
+            rank_str = f"#{rank}" if rank else "н/д"
+            lines.append(f"{i}. {name} ({symbol}) — капа {rank_str}")
+        lines.append(DIVIDER)
+
+        text = "\n".join(lines)
+        keyboard = Keyboards.simple_nav(refresh_callback="trending")
         return (text, keyboard)
 
     async def _render_ta(self, coin_id: str) -> tuple:
@@ -1027,11 +1100,13 @@ class CryptoBot:
             f"📖 <b>СПРАВКА</b>\n{DIVIDER}\n\n"
             f"Всё управляется кнопками — жми /start и выбирай нужное в меню.\n"
             f"Для тех, кто любит печатать, команды тоже работают:\n\n"
-            f"/analyze [монета], /price [монета], /compare [c1] [c2], /top\n"
+            f"/analyze [монета], /price [монета], /compare [c1] [c2], /top, /trending\n"
             f"/ta [монета], /exchanges [тикер], /screener, /news [монета]\n"
             f"/community, /invite, /rules\n\n"
             f"Продвинутая аналитика (ТА/биржи/скринер/новости) — {FREE_DAILY_ADVANCED_LIMIT} бесплатных запроса в день, "
-            f"дальше — тариф Standard.\n{DIVIDER}"
+            f"дальше — тариф Standard.\n\n"
+            f"<i>Для админов группы:</i> /setgroup — зарегистрировать группу, чтобы бот сам постил "
+            f"свежие новости; /autopost on|off — вкл/выкл.\n{DIVIDER}"
         )
         return (text, Keyboards.main_menu())
 
@@ -1165,6 +1240,11 @@ class CryptoBot:
             await self._edit_or_send(query, text, keyboard)
             return
 
+        if data == 'trending':
+            text, keyboard = await self._render_trending()
+            await self._edit_or_send(query, text, keyboard)
+            return
+
         if data == 'screener':
             text, keyboard = await self._render_screener()
             within, used = self._check_and_bump_limit(user_id, 'advanced', FREE_DAILY_ADVANCED_LIMIT)
@@ -1195,6 +1275,15 @@ class CryptoBot:
 
         if data.startswith('go:'):
             _, action, token = data.split(':', 2)
+            if token == 'cur':
+                token = context.user_data.get('cur_symbol') if action == 'exchanges' else context.user_data.get('cur_coin')
+                if not token:
+                    await query.answer("Монета не сохранена, выбери заново", show_alert=True)
+                    return
+            elif action == 'exchanges':
+                context.user_data['cur_symbol'] = token
+            else:
+                context.user_data['cur_coin'] = token
             result = await self._dispatch(action, token, user_id)
             if result is None:
                 await query.answer("Неизвестное действие", show_alert=True)
@@ -1205,6 +1294,9 @@ class CryptoBot:
     # ---------- Текстовый ввод произвольной монеты ----------
 
     async def on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if update.effective_chat.type in ('group', 'supergroup'):
+            self._maybe_register_group(update.effective_chat.id)
+
         awaiting = context.user_data.get('awaiting')
         if not awaiting:
             return  # обычное сообщение вне диалога (например, в групповом чате) — не мешаем
@@ -1230,9 +1322,11 @@ class CryptoBot:
 
         if awaiting == 'exchanges':
             token = text_in.upper()
+            context.user_data['cur_symbol'] = token
         else:
             resolved = await self._resolve_coin_id(text_in.lower())
             token = resolved or text_in.lower()
+            context.user_data['cur_coin'] = token
 
         result = await self._dispatch(awaiting, token, user_id)
         if result is None:
@@ -1286,7 +1380,16 @@ class CryptoBot:
         text, keyboard = self._render_rules()
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
+    def _maybe_register_group(self, chat_id: int):
+        """Автоматически запоминаем группу сообщества по первой же активности в ней"""
+        if self.data.get('known_group_chat_id') != chat_id:
+            self.data['known_group_chat_id'] = chat_id
+            self.data.setdefault('autopost_enabled', True)
+            save_data(self.data)
+            logger.info(f"Обнаружена группа сообщества: chat_id={chat_id}")
+
     async def welcome_new_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        self._maybe_register_group(update.effective_chat.id)
         for member in update.message.new_chat_members:
             if member.is_bot:
                 continue
@@ -1298,6 +1401,125 @@ class CryptoBot:
             )
             await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
+    async def _is_group_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        try:
+            member = await context.bot.get_chat_member(update.effective_chat.id, update.effective_user.id)
+            return member.status in ('administrator', 'creator')
+        except Exception:
+            return False
+
+    async def setgroup(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Явно назначить текущую группу как группу сообщества для автопостинга новостей"""
+        chat = update.effective_chat
+        if chat.type not in ('group', 'supergroup'):
+            await update.message.reply_text("❌ Эта команда работает только внутри группы сообщества.")
+            return
+        if not await self._is_group_admin(update, context):
+            await update.message.reply_text("❌ Настроить автопостинг могут только админы группы.")
+            return
+        self.data['known_group_chat_id'] = chat.id
+        self.data['autopost_enabled'] = True
+        save_data(self.data)
+        await update.message.reply_text(
+            "✅ Эта группа зарегистрирована для автопостинга новостей.\n"
+            "Управление: /autopost on или /autopost off"
+        )
+
+    async def autopost(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Включить/выключить автопостинг новостей в группе (/autopost on|off)"""
+        chat = update.effective_chat
+        if chat.type not in ('group', 'supergroup'):
+            await update.message.reply_text("❌ Эта команда работает только внутри группы сообщества.")
+            return
+        if not await self._is_group_admin(update, context):
+            await update.message.reply_text("❌ Настроить автопостинг могут только админы группы.")
+            return
+
+        args = [a.lower() for a in (context.args or [])]
+        if 'off' in args:
+            self.data['autopost_enabled'] = False
+            save_data(self.data)
+            await update.message.reply_text("🔕 Автопостинг новостей выключен.")
+        elif 'on' in args:
+            self.data['autopost_enabled'] = True
+            self.data['known_group_chat_id'] = chat.id
+            save_data(self.data)
+            await update.message.reply_text("🔔 Автопостинг новостей включён для этой группы.")
+        else:
+            enabled = self.data.get('autopost_enabled', True) and self.data.get('known_group_chat_id') == chat.id
+            status = "включён 🔔" if enabled else "выключен 🔕"
+            await update.message.reply_text(
+                f"Автопостинг новостей сейчас: {status}\nВключить/выключить: /autopost on · /autopost off"
+            )
+
+    def _match_coin_in_title(self, title: str):
+        """Ищем упоминание известной монеты в заголовке новости (для тега и кнопок ТА/Анализ)"""
+        title_lower = title.lower()
+        for coin_id, symbol, _emoji in POPULAR_COINS:
+            name_words = coin_id.replace('-', ' ')
+            for pattern in (re.escape(symbol.lower()), re.escape(name_words)):
+                if re.search(rf'\b{pattern}\b', title_lower):
+                    return coin_id, symbol
+        return None
+
+    def _render_news_post(self, item: dict) -> tuple:
+        """Автоформатирование карточки поста из новости для публикации в группе"""
+        title = esc(item.get('title') or 'Новость')
+        source = esc(item.get('source', ''))
+        url = item.get('url', '')
+        matched = self._match_coin_in_title(item.get('title', ''))
+
+        tag = f" #{matched[1]}" if matched else ""
+        text = f"📰 <b>{title}</b>{tag}\n{DIVIDER}\n<i>{source}</i>"
+
+        buttons = []
+        if url:
+            buttons.append([InlineKeyboardButton("Читать полностью →", url=url)])
+        if matched:
+            coin_id, symbol = matched
+            buttons.append([
+                InlineKeyboardButton(f"📐 ТА {symbol}", callback_data=f"go:ta:{coin_id}"),
+                InlineKeyboardButton(f"📊 Анализ {symbol}", callback_data=f"go:analyze:{coin_id}"),
+            ])
+        if self.bot_username:
+            buttons.append([InlineKeyboardButton("🧊 Открыть бота", url=f"https://t.me/{self.bot_username}")])
+
+        return text, InlineKeyboardMarkup(buttons)
+
+    async def _news_autopost_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """Фоновая задача (JobQueue): раз в N минут проверяет RSS и постит новые новости в группу"""
+        chat_id = self.data.get('known_group_chat_id')
+        if not chat_id or not self.data.get('autopost_enabled', True):
+            return
+
+        loop = asyncio.get_running_loop()
+        try:
+            items = await loop.run_in_executor(None, NewsService.get_latest, 8)
+        except Exception as e:
+            logger.error(f"Автопостинг: ошибка получения новостей: {e}")
+            return
+
+        posted = set(self.data.get('posted_news_urls', []))
+        new_items = [it for it in items if it.get('url') and it['url'] not in posted]
+        if not new_items:
+            return
+
+        # Публикуем от старых к новым — так лента в группе идёт в хронологическом порядке
+        for item in reversed(new_items):
+            text, keyboard = self._render_news_post(item)
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard, disable_web_page_preview=False,
+                )
+            except Exception as e:
+                logger.error(f"Автопостинг: не удалось отправить сообщение: {e}")
+                continue
+            posted.add(item['url'])
+
+        self.data['posted_news_urls'] = list(posted)[-300:]
+        save_data(self.data)
+
     async def analyze(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('analyze'))
@@ -1307,6 +1529,7 @@ class CryptoBot:
         if not coin_id:
             await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
             return
+        context.user_data['cur_coin'] = coin_id
         result = await self._dispatch('analyze', coin_id, update.effective_user.id)
         await self._send_result(update.message, result)
 
@@ -1319,6 +1542,7 @@ class CryptoBot:
         if not coin_id:
             await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
             return
+        context.user_data['cur_coin'] = coin_id
         result = await self._dispatch('price', coin_id, update.effective_user.id)
         await self._send_result(update.message, result)
 
@@ -1338,6 +1562,11 @@ class CryptoBot:
         text, keyboard = await self._render_top()
         await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
+    async def trending(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
+        text, keyboard = await self._render_trending()
+        await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
     async def ta(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Выбери монету:", reply_markup=Keyboards.coin_picker('ta'))
@@ -1347,6 +1576,7 @@ class CryptoBot:
         if not coin_id:
             await update.message.reply_text("❌ Монета не найдена", reply_markup=Keyboards.simple_nav())
             return
+        context.user_data['cur_coin'] = coin_id
         result = await self._dispatch('ta', coin_id, update.effective_user.id)
         await self._send_result(update.message, result)
 
@@ -1357,6 +1587,7 @@ class CryptoBot:
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         ticker = context.args[0].upper()
         quote = context.args[1].upper() if len(context.args) > 1 else 'USDT'
+        context.user_data['cur_symbol'] = ticker
         result = await self._dispatch('exchanges', ticker, update.effective_user.id, quote=quote)
         await self._send_result(update.message, result)
 
@@ -1374,6 +1605,7 @@ class CryptoBot:
             return
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
         keyword = ' '.join(context.args)
+        context.user_data['cur_coin'] = keyword.lower()
         result = await self._dispatch('news', keyword, update.effective_user.id)
         await self._send_result(update.message, result)
 
